@@ -368,6 +368,18 @@ fn get_command_documentation(
         }
     }
 
+    let parameter_sets = sig.collect_parameter_sets();
+    if !parameter_sets.is_empty() {
+        let _ = write!(long_desc, "\n{help_section_name}Parameter sets{RESET}:\n");
+        let _ = writeln!(
+            long_desc,
+            "  Exactly one of the following sets may be used when calling this command."
+        );
+        for summary in parameter_sets.summaries() {
+            let _ = writeln!(long_desc, "  - {summary}");
+        }
+    }
+
     fn get_term_width() -> usize {
         if let Ok((w, _h)) = terminal_size() {
             w as usize

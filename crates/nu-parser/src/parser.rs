@@ -14,9 +14,9 @@ use log::trace;
 use nu_engine::DIR_VAR_PARSER_INFO;
 use nu_protocol::{
     BlockId, Completion, DeclId, DidYouMean, ENV_VARIABLE_ID, FilesizeUnit, Flag, IN_VARIABLE_ID,
-    ParseError, PositionalArg, ShellError, Signature, Span, Spanned, SyntaxShape, Type, Value,
-    VarId, ast::*, casing::Casing, did_you_mean, engine::StateWorkingSet,
-    eval_const::eval_constant,
+    ParameterId, ParameterMetadata, ParameterRole, ParameterSet, ParseError, PositionalArg,
+    ShellError, Signature, Span, Spanned, SyntaxShape, Type, Value, VarId, ast::*, casing::Casing,
+    did_you_mean, engine::StateWorkingSet, eval_const::eval_constant,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -183,6 +183,21 @@ pub enum CallKind {
     Invalid,
 }
 
+#[derive(Default)]
+struct ParameterUsage {
+    present: bool,
+    span: Option<Span>,
+}
+
+impl ParameterUsage {
+    fn mark(&mut self, span: Span) {
+        self.present = true;
+        if self.span.is_none() {
+            self.span = Some(span);
+        }
+    }
+}
+
 pub(crate) fn check_call(
     working_set: &mut StateWorkingSet,
     command: Span,
@@ -239,6 +254,204 @@ pub(crate) fn check_call(
             }
         }
     }
+
+    let parameter_sets = sig.collect_parameter_sets();
+    if parameter_sets.is_empty() {
+        return CallKind::Valid;
+    }
+
+    let mut usage: HashMap<ParameterId, ParameterUsage> = HashMap::new();
+    for parameter in &parameter_sets.parameters {
+        usage.insert(parameter.id.clone(), ParameterUsage::default());
+    }
+
+    let positional_total = sig.required_positional.len() + sig.optional_positional.len();
+    for idx in 0..positional_total {
+        if let Some(expr) = call.positional_nth(idx) {
+            if let Some(entry) = usage.get_mut(&ParameterId::Positional(idx)) {
+                entry.mark(expr.span);
+            }
+        }
+    }
+
+    if usage.contains_key(&ParameterId::Rest) {
+        let rest_start = positional_total;
+        for (expr, _) in call.rest_iter(rest_start) {
+            if let Some(entry) = usage.get_mut(&ParameterId::Rest) {
+                entry.mark(expr.span);
+            }
+        }
+    }
+
+    for (name, short, _) in call.named_iter() {
+        for parameter in &parameter_sets.parameters {
+            let ParameterRole::Flag {
+                long,
+                short: param_short,
+            } = &parameter.role
+            else {
+                continue;
+            };
+
+            let mut matched = false;
+
+            if let Some(long_name) = long.as_ref() {
+                if !long_name.is_empty() && name.item == *long_name {
+                    matched = true;
+                }
+            }
+
+            if !matched {
+                if let (Some(param_short), Some(short_name)) =
+                    (param_short.as_ref(), short.as_ref())
+                {
+                    if short_name.item.starts_with(*param_short) {
+                        matched = true;
+                    }
+                }
+            }
+
+            if matched {
+                if let Some(entry) = usage.get_mut(&parameter.id) {
+                    let span = short.as_ref().map(|s| s.span).unwrap_or(name.span);
+                    entry.mark(span);
+                }
+                break;
+            }
+        }
+    }
+
+    let set_summaries = parameter_sets.summaries();
+    let call_span = call.arguments_span();
+
+    let mut provided: Vec<(&ParameterMetadata, Option<Span>)> = Vec::new();
+    for parameter in &parameter_sets.parameters {
+        if let Some(entry) = usage.get(&parameter.id) {
+            if entry.present {
+                provided.push((parameter, entry.span));
+            }
+        }
+    }
+
+    if provided.is_empty() {
+        let help = format!("Provide arguments for one of: {}", set_summaries.join("; "));
+        working_set.error(ParseError::ParameterSetMissing {
+            message: "No parameter set selected.".to_string(),
+            label: "select one of these sets".to_string(),
+            span: call_span,
+            help,
+        });
+        return CallKind::Invalid;
+    }
+
+    let mut possible_sets: Vec<&str> = parameter_sets
+        .set_names
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    let join_sets = |sets: &[&str]| -> String {
+        sets.iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    for (idx, (parameter, span)) in provided.iter().enumerate() {
+        let allowed_sets = parameter.membership_sets(&parameter_sets.set_names);
+        if allowed_sets.is_empty() {
+            continue;
+        }
+
+        let prev_sets = possible_sets.clone();
+        possible_sets.retain(|candidate| allowed_sets.iter().any(|allowed| allowed == candidate));
+
+        if possible_sets.is_empty() {
+            let mut argument_names: Vec<String> = provided
+                .iter()
+                .take(idx)
+                .map(|(p, _)| p.display_name.clone())
+                .collect();
+            argument_names.push(parameter.display_name.clone());
+            dedup_strings(&mut argument_names);
+
+            let allowed_list = allowed_sets.clone();
+            let help = format!(
+                "{} belongs to {} but other arguments require {}. Choose exactly one of: {}",
+                parameter.display_name,
+                join_sets(&allowed_list),
+                join_sets(&prev_sets),
+                set_summaries.join("; ")
+            );
+
+            working_set.error(ParseError::ParameterSetConflict {
+                arguments: argument_names.join(", "),
+                span: span.unwrap_or(call_span),
+                help,
+            });
+            return CallKind::Invalid;
+        }
+    }
+
+    if possible_sets.len() > 1 {
+        let argument_names: Vec<String> = provided
+            .iter()
+            .map(|(p, _)| p.display_name.clone())
+            .collect();
+
+        let help = format!(
+            "Arguments {} match multiple parameter sets ({}). Choose one of: {}",
+            argument_names.join(", "),
+            join_sets(&possible_sets),
+            set_summaries.join("; ")
+        );
+
+        working_set.error(ParseError::ParameterSetAmbiguous {
+            arguments: argument_names.join(", "),
+            candidates: possible_sets.iter().map(|s| (*s).to_string()).collect(),
+            span: provided
+                .iter()
+                .filter_map(|(_, span)| *span)
+                .next_back()
+                .unwrap_or(call_span),
+            help,
+        });
+        return CallKind::Invalid;
+    }
+
+    let Some(selected_set) = possible_sets.first() else {
+        return CallKind::Valid;
+    };
+
+    let mut missing: Vec<String> = Vec::new();
+    for parameter in &parameter_sets.parameters {
+        if parameter.is_mandatory_in(selected_set) {
+            let present = usage
+                .get(&parameter.id)
+                .map(|entry| entry.present)
+                .unwrap_or(false);
+            if !present {
+                missing.push(parameter.display_name.clone());
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        let help = format!(
+            "Add {} or choose one of: {}",
+            missing.join(", "),
+            set_summaries.join("; ")
+        );
+
+        working_set.error(ParseError::ParameterSetMissing {
+            message: format!("Parameter set '{selected_set}' is missing mandatory arguments."),
+            label: format!("missing: {}", missing.join(", ")),
+            span: call_span,
+            help,
+        });
+        return CallKind::Invalid;
+    }
+
     CallKind::Valid
 }
 
@@ -1129,6 +1342,8 @@ pub fn parse_internal_call(
                     var_id: None,
                     default_value: None,
                     completion: None,
+                    parameter_sets: vec![],
+                    parameter_set_mandatory: vec![],
                 })
             }
 
@@ -3847,6 +4062,8 @@ pub fn parse_row_condition(working_set: &mut StateWorkingSet, spans: &[Span]) ->
                 var_id: Some(var_id),
                 default_value: None,
                 completion: None,
+                parameter_sets: vec![],
+                parameter_set_mandatory: vec![],
             });
 
             compile_block(working_set, &mut block);
@@ -3887,6 +4104,151 @@ pub fn parse_signature(working_set: &mut StateWorkingSet, span: Span) -> Express
     Expression::new(working_set, Expr::Signature(sig), span, Type::Any)
 }
 
+#[derive(Debug)]
+enum ParsedParameterAttribute {
+    MemberOf(Vec<String>),
+    MandatoryAll,
+    Mandatory(Vec<String>),
+}
+
+fn parse_parameter_attribute(
+    contents: &[u8],
+    span: Span,
+) -> Result<ParsedParameterAttribute, ParseError> {
+    let text = String::from_utf8(contents.to_vec()).map_err(|_| ParseError::NonUtf8(span))?;
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix('@') else {
+        return Err(ParseError::InvalidParameterAttribute {
+            attribute: trimmed.to_string(),
+            help: "Parameter attributes must begin with '@'.".to_string(),
+            span,
+        });
+    };
+
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err(ParseError::InvalidParameterAttribute {
+            attribute: String::new(),
+            help: "Specify an attribute name, for example @set(name).".to_string(),
+            span,
+        });
+    }
+
+    let (name, args) = if let Some(paren_index) = rest.find('(') {
+        let (name, args) = rest.split_at(paren_index);
+        (name.trim(), Some(args.trim()))
+    } else {
+        (rest, None)
+    };
+
+    match (name, args) {
+        ("set", Some(args)) => {
+            parse_attribute_names(name, args, span).map(ParsedParameterAttribute::MemberOf)
+        }
+        ("mandatory", Some(args)) => {
+            parse_attribute_names(name, args, span).map(ParsedParameterAttribute::Mandatory)
+        }
+        ("mandatory", None) => Ok(ParsedParameterAttribute::MandatoryAll),
+        ("set", None) => Err(ParseError::InvalidParameterAttribute {
+            attribute: "set".to_string(),
+            help: "Use @set(name) to add a parameter to a parameter set.".to_string(),
+            span,
+        }),
+        (other, _) => Err(ParseError::UnknownParameterAttribute {
+            attribute: other.to_string(),
+            span,
+        }),
+    }
+}
+
+fn parse_attribute_names(
+    attr_name: &str,
+    args: &str,
+    span: Span,
+) -> Result<Vec<String>, ParseError> {
+    let args = args.trim();
+    if !args.starts_with('(') || !args.ends_with(')') {
+        return Err(ParseError::InvalidParameterAttribute {
+            attribute: attr_name.to_string(),
+            help: format!("Use @{attr_name}(name) to specify parameter sets."),
+            span,
+        });
+    }
+
+    let inner = &args[1..args.len() - 1];
+    let mut names = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes: Option<char> = None;
+    let mut escape = false;
+
+    for ch in inner.chars() {
+        if let Some(quote) = in_quotes {
+            if escape {
+                current.push(ch);
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == quote {
+                in_quotes = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => {
+                in_quotes = Some(ch);
+            }
+            ',' | ' ' | '\t' | '\n' | '\r' => {
+                if !current.trim().is_empty() {
+                    names.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if escape || in_quotes.is_some() {
+        return Err(ParseError::InvalidParameterAttribute {
+            attribute: attr_name.to_string(),
+            help: "Unterminated quoted value in attribute.".to_string(),
+            span,
+        });
+    }
+
+    if !current.trim().is_empty() {
+        names.push(current.trim().to_string());
+    }
+
+    if names.is_empty() {
+        return Err(ParseError::InvalidParameterAttribute {
+            attribute: attr_name.to_string(),
+            help: format!("Specify at least one name in @{attr_name}(...)"),
+            span,
+        });
+    }
+
+    dedup_strings(&mut names);
+    Ok(names)
+}
+
+fn dedup_strings(values: &mut Vec<String>) {
+    let mut i = 0;
+    while i < values.len() {
+        let mut j = i + 1;
+        while j < values.len() {
+            if values[j] == values[i] {
+                values.remove(j);
+            } else {
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
 pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> Box<Signature> {
     enum ParseMode {
         Arg,
@@ -3896,17 +4258,29 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
         DefaultValue,
     }
 
+    #[derive(Debug, Default)]
+    struct ParameterSetAttr {
+        member_of: Vec<String>,
+        mandatory_in: Vec<String>,
+        mandatory_all: bool,
+    }
+
     #[derive(Debug)]
     enum Arg {
         Positional {
             arg: PositionalArg,
             required: bool,
             type_annotated: bool,
+            attrs: ParameterSetAttr,
         },
-        RestPositional(PositionalArg),
+        RestPositional {
+            arg: PositionalArg,
+            attrs: ParameterSetAttr,
+        },
         Flag {
             flag: Flag,
             type_annotated: bool,
+            attrs: ParameterSetAttr,
         },
     }
 
@@ -3994,6 +4368,52 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                 } else {
                     match parse_mode {
                         ParseMode::Arg | ParseMode::AfterCommaArg | ParseMode::AfterType => {
+                            if contents.starts_with(b"@") {
+                                match parse_parameter_attribute(&contents, span) {
+                                    Ok(parsed) => {
+                                        if let Some(last) = args.last_mut() {
+                                            match (last, parsed) {
+                                                (
+                                                    Arg::Positional { attrs, .. }
+                                                    | Arg::RestPositional { attrs, .. }
+                                                    | Arg::Flag { attrs, .. },
+                                                    ParsedParameterAttribute::MemberOf(mut sets),
+                                                ) => {
+                                                    attrs.member_of.append(&mut sets);
+                                                    dedup_strings(&mut attrs.member_of);
+                                                }
+                                                (
+                                                    Arg::Positional { attrs, .. }
+                                                    | Arg::RestPositional { attrs, .. }
+                                                    | Arg::Flag { attrs, .. },
+                                                    ParsedParameterAttribute::Mandatory(mut sets),
+                                                ) => {
+                                                    attrs.mandatory_in.append(&mut sets);
+                                                    dedup_strings(&mut attrs.mandatory_in);
+                                                }
+                                                (
+                                                    Arg::Positional { attrs, .. }
+                                                    | Arg::RestPositional { attrs, .. }
+                                                    | Arg::Flag { attrs, .. },
+                                                    ParsedParameterAttribute::MandatoryAll,
+                                                ) => {
+                                                    attrs.mandatory_all = true;
+                                                }
+                                            }
+                                        } else {
+                                            let attribute =
+                                                String::from_utf8_lossy(&contents).to_string();
+                                            working_set.error(ParseError::InvalidParameterAttribute {
+                                                attribute,
+                                                help: "Parameter attributes must follow a flag or parameter definition.".to_string(),
+                                                span,
+                                            });
+                                        }
+                                    }
+                                    Err(err) => working_set.error(err),
+                                }
+                                continue;
+                            }
                             // Long flag with optional short form following with no whitespace, e.g. --output, --age(-a)
                             if contents.starts_with(b"--") && contents.len() > 2 {
                                 // Split the long flag from the short flag with the ( character as delimiter.
@@ -4031,8 +4451,11 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                             var_id: Some(var_id),
                                             default_value: None,
                                             completion: None,
+                                            parameter_sets: vec![],
+                                            parameter_set_mandatory: vec![],
                                         },
                                         type_annotated: false,
+                                        attrs: ParameterSetAttr::default(),
                                     });
                                 } else if flags.len() >= 3 {
                                     working_set.error(ParseError::Expected(
@@ -4071,8 +4494,11 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                                 var_id: Some(var_id),
                                                 default_value: None,
                                                 completion: None,
+                                                parameter_sets: vec![],
+                                                parameter_set_mandatory: vec![],
                                             },
                                             type_annotated: false,
+                                            attrs: ParameterSetAttr::default(),
                                         });
                                     } else {
                                         working_set.error(ParseError::Expected("short flag", span));
@@ -4114,8 +4540,11 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                         var_id: Some(var_id),
                                         default_value: None,
                                         completion: None,
+                                        parameter_sets: vec![],
+                                        parameter_set_mandatory: vec![],
                                     },
                                     type_annotated: false,
+                                    attrs: ParameterSetAttr::default(),
                                 });
                                 parse_mode = ParseMode::Arg;
                             }
@@ -4184,9 +4613,12 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                         var_id: Some(var_id),
                                         default_value: None,
                                         completion: None,
+                                        parameter_sets: vec![],
+                                        parameter_set_mandatory: vec![],
                                     },
                                     required: false,
                                     type_annotated: false,
+                                    attrs: ParameterSetAttr::default(),
                                 });
                                 parse_mode = ParseMode::Arg;
                             }
@@ -4205,14 +4637,19 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                 let var_id =
                                     working_set.add_variable(contents_vec, span, Type::Any, false);
 
-                                args.push(Arg::RestPositional(PositionalArg {
-                                    desc: String::new(),
-                                    name,
-                                    shape: SyntaxShape::Any,
-                                    var_id: Some(var_id),
-                                    default_value: None,
-                                    completion: None,
-                                }));
+                                args.push(Arg::RestPositional {
+                                    arg: PositionalArg {
+                                        desc: String::new(),
+                                        name,
+                                        shape: SyntaxShape::Any,
+                                        var_id: Some(var_id),
+                                        default_value: None,
+                                        completion: None,
+                                        parameter_sets: vec![],
+                                        parameter_set_mandatory: vec![],
+                                    },
+                                    attrs: ParameterSetAttr::default(),
+                                });
                                 parse_mode = ParseMode::Arg;
                             }
                             // Normal param
@@ -4239,9 +4676,12 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                         var_id: Some(var_id),
                                         default_value: None,
                                         completion: None,
+                                        parameter_sets: vec![],
+                                        parameter_set_mandatory: vec![],
                                     },
                                     required: true,
                                     type_annotated: false,
+                                    attrs: ParameterSetAttr::default(),
                                 });
                                 parse_mode = ParseMode::Arg;
                             }
@@ -4281,6 +4721,7 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                             },
                                         required: _,
                                         type_annotated,
+                                        attrs: _,
                                     } => {
                                         working_set.set_variable_type(
                                             var_id.expect(
@@ -4293,12 +4734,16 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                         *shape = syntax_shape;
                                         *type_annotated = true;
                                     }
-                                    Arg::RestPositional(PositionalArg {
-                                        shape,
-                                        var_id,
-                                        completion,
+                                    Arg::RestPositional {
+                                        arg:
+                                            PositionalArg {
+                                                shape,
+                                                var_id,
+                                                completion,
+                                                ..
+                                            },
                                         ..
-                                    }) => {
+                                    } => {
                                         working_set.set_variable_type(
                                             var_id.expect(
                                                 "internal error: all custom parameters must have \
@@ -4318,6 +4763,7 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                                 ..
                                             },
                                         type_annotated,
+                                        attrs: _,
                                     } => {
                                         working_set.set_variable_type(var_id.expect("internal error: all custom parameters must have var_ids"), syntax_shape.to_type());
                                         if syntax_shape == SyntaxShape::Boolean {
@@ -4351,6 +4797,7 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                             },
                                         required,
                                         type_annotated,
+                                        attrs: _,
                                     } => {
                                         let var_id = var_id.expect("internal error: all custom parameters must have var_ids");
                                         let var_type = &working_set.get_variable(var_id).ty;
@@ -4394,7 +4841,7 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                         }
                                         *required = false;
                                     }
-                                    Arg::RestPositional(..) => {
+                                    Arg::RestPositional { .. } => {
                                         working_set.error(ParseError::AssignmentMismatch(
                                             "Rest parameter was given a default value".into(),
                                             "can't have default value".into(),
@@ -4410,6 +4857,7 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                                                 ..
                                             },
                                         type_annotated,
+                                        attrs: _,
                                     } => {
                                         let expression_span = expression.span;
 
@@ -4486,7 +4934,9 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
                             }
                             positional.desc.push_str(&contents);
                         }
-                        Arg::RestPositional(positional) => {
+                        Arg::RestPositional {
+                            arg: positional, ..
+                        } => {
                             if !positional.desc.is_empty() {
                                 positional.desc.push('\n');
                             }
@@ -4499,35 +4949,131 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
         }
     }
 
+    let mut all_parameter_sets: Vec<String> = Vec::new();
+    for arg in &args {
+        match arg {
+            Arg::Positional { attrs, .. }
+            | Arg::RestPositional { attrs, .. }
+            | Arg::Flag { attrs, .. } => {
+                all_parameter_sets.extend(attrs.member_of.iter().cloned());
+                all_parameter_sets.extend(attrs.mandatory_in.iter().cloned());
+            }
+        }
+    }
+    dedup_strings(&mut all_parameter_sets);
+
     let mut sig = Signature::new(String::new());
+
+    fn apply_parameter_attrs(
+        working_set: &mut StateWorkingSet,
+        span: Span,
+        all_parameter_sets: &[String],
+        attrs: ParameterSetAttr,
+        label: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut sets = attrs.member_of;
+        dedup_strings(&mut sets);
+        let mut mandatory = attrs.mandatory_in;
+        dedup_strings(&mut mandatory);
+
+        if attrs.mandatory_all {
+            if sets.is_empty() {
+                mandatory.extend(all_parameter_sets.iter().cloned());
+            } else {
+                for set in &sets {
+                    if !mandatory.iter().any(|name| name == set) {
+                        mandatory.push(set.clone());
+                    }
+                }
+            }
+        }
+
+        if !sets.is_empty() {
+            let mut invalid = Vec::new();
+            mandatory.retain(|name| {
+                if sets.iter().any(|set| set == name) {
+                    true
+                } else {
+                    invalid.push(name.clone());
+                    false
+                }
+            });
+
+            if !invalid.is_empty() {
+                let help = format!(
+                    "Add @set({}) to `{label}` before marking it mandatory in those sets.",
+                    invalid.join(" ")
+                );
+                working_set.error(ParseError::InvalidParameterAttribute {
+                    attribute: "mandatory".to_string(),
+                    help,
+                    span,
+                });
+            }
+        }
+
+        dedup_strings(&mut mandatory);
+        (sets, mandatory)
+    }
 
     for arg in args {
         match arg {
             Arg::Positional {
-                arg: positional,
+                mut arg,
                 required,
+                attrs,
                 ..
             } => {
+                let (sets, mandatory) =
+                    apply_parameter_attrs(working_set, span, &all_parameter_sets, attrs, &arg.name);
+                arg.parameter_sets = sets;
+                arg.parameter_set_mandatory = mandatory;
                 if required {
                     if !sig.optional_positional.is_empty() {
-                        working_set.error(ParseError::RequiredAfterOptional(
-                            positional.name.clone(),
-                            span,
-                        ))
+                        working_set.error(ParseError::RequiredAfterOptional(arg.name.clone(), span))
                     }
-                    sig.required_positional.push(positional)
+                    sig.required_positional.push(arg)
                 } else {
-                    sig.optional_positional.push(positional)
+                    sig.optional_positional.push(arg)
                 }
             }
-            Arg::Flag { flag, .. } => sig.named.push(flag),
-            Arg::RestPositional(positional) => {
-                if positional.name.is_empty() {
+            Arg::Flag {
+                mut flag, attrs, ..
+            } => {
+                let flag_label = if flag.long.is_empty() {
+                    flag.short
+                        .map(|c| format!("-{c}"))
+                        .unwrap_or_else(|| "flag".to_string())
+                } else {
+                    format!("--{}", flag.long)
+                };
+                let (sets, mandatory) = apply_parameter_attrs(
+                    working_set,
+                    span,
+                    &all_parameter_sets,
+                    attrs,
+                    &flag_label,
+                );
+                flag.parameter_sets = sets;
+                flag.parameter_set_mandatory = mandatory;
+                sig.named.push(flag)
+            }
+            Arg::RestPositional { mut arg, attrs } => {
+                let label = if arg.name.is_empty() {
+                    "rest".to_string()
+                } else {
+                    format!("...{}", arg.name)
+                };
+                let (sets, mandatory) =
+                    apply_parameter_attrs(working_set, span, &all_parameter_sets, attrs, &label);
+                arg.parameter_sets = sets;
+                arg.parameter_set_mandatory = mandatory;
+                if arg.name.is_empty() {
                     working_set.error(ParseError::RestNeedsName(span))
                 } else if sig.rest_positional.is_none() {
                     sig.rest_positional = Some(PositionalArg {
-                        name: positional.name,
-                        ..positional
+                        name: arg.name,
+                        ..arg
                     })
                 } else {
                     // Too many rest params
@@ -4536,6 +5082,11 @@ pub fn parse_signature_helper(working_set: &mut StateWorkingSet, span: Span) -> 
             }
         }
     }
+
+    sig.parameter_sets = all_parameter_sets
+        .into_iter()
+        .map(ParameterSet::new)
+        .collect();
 
     Box::new(sig)
 }

@@ -567,6 +567,55 @@ pub enum ParseError {
         help("try following this line with a `def` or `extern` definition")
     )]
     AttributeRequiresDefinition(#[label("must be followed by a definition")] Span),
+
+    #[error("Unknown parameter attribute '{attribute}'.")]
+    #[diagnostic(
+        code(nu::parser::parameter_attribute_unknown),
+        help("Supported attributes: @set(name), @mandatory, @mandatory(name).")
+    )]
+    UnknownParameterAttribute {
+        attribute: String,
+        #[label("unknown attribute")]
+        span: Span,
+    },
+
+    #[error("Invalid parameter attribute '{attribute}'.")]
+    #[diagnostic(code(nu::parser::parameter_attribute_invalid), help("{help}"))]
+    InvalidParameterAttribute {
+        attribute: String,
+        help: String,
+        #[label("invalid attribute")]
+        span: Span,
+    },
+
+    #[error("Arguments {arguments} come from different parameter sets.")]
+    #[diagnostic(code(nu::parser::parameter_set_conflict), help("{help}"))]
+    ParameterSetConflict {
+        arguments: String,
+        #[label("conflicting arguments")]
+        span: Span,
+        help: String,
+    },
+
+    #[error("{message}")]
+    #[diagnostic(code(nu::parser::parameter_set_missing), help("{help}"))]
+    ParameterSetMissing {
+        message: String,
+        #[label("{label}")]
+        span: Span,
+        label: String,
+        help: String,
+    },
+
+    #[error("Ambiguous parameter set selection.")]
+    #[diagnostic(code(nu::parser::parameter_set_ambiguous), help("{help}"))]
+    ParameterSetAmbiguous {
+        arguments: String,
+        candidates: Vec<String>,
+        #[label("ambiguous arguments")]
+        span: Span,
+        help: String,
+    },
 }
 
 impl ParseError {
@@ -659,6 +708,11 @@ impl ParseError {
             ParseError::AssignmentRequiresVar(s) => *s,
             ParseError::AssignmentRequiresMutableVar(s) => *s,
             ParseError::AttributeRequiresDefinition(s) => *s,
+            ParseError::UnknownParameterAttribute { span, .. } => *span,
+            ParseError::InvalidParameterAttribute { span, .. } => *span,
+            ParseError::ParameterSetConflict { span, .. } => *span,
+            ParseError::ParameterSetMissing { span, .. } => *span,
+            ParseError::ParameterSetAmbiguous { span, .. } => *span,
         }
     }
 }

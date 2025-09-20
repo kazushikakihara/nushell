@@ -17,6 +17,7 @@ A new type of shell.
 - [Learning About Nu](#learning-about-nu)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Parameter sets](#parameter-sets)
 - [Philosophy](#philosophy)
   - [Pipelines](#pipelines)
   - [Opening files](#opening-files)
@@ -70,6 +71,34 @@ $nu.config-path
 ```
 
 Please see our [book](https://www.nushell.sh) for all of the Nushell documentation.
+
+
+## Parameter sets
+
+Custom commands can now describe mutually exclusive groups of arguments using *parameter sets*. A parameter set defines the arguments that belong together, and Nushell enforces that exactly one set is used each time the command runs. Within a set you can mark individual parameters as mandatory, while parameters that belong to multiple sets can be shared across the different call patterns.
+
+```nu
+def "git add-to-head" [
+  --staged(-s) @set(staged) @mandatory
+  ...rest: string @set(paths) @mandatory(paths)
+] {
+  if $staged {
+    print "Adding staged files"
+  } else {
+    print $"Adding ($rest | length) path(s)"
+  }
+}
+
+# Valid calls
+git add-to-head -s
+git add-to-head Cargo.toml README.md
+
+# Invalid combinations
+git add-to-head -s Cargo.toml  # arguments come from different sets
+git add-to-head                # no set selected
+```
+
+Use `@set(name)` to assign a parameter to a set and `@mandatory` (optionally with a set name) to require it when that set is chosen. Nushell surfaces clear parse-time errors when the call is ambiguous, mixes arguments from multiple sets, or omits mandatory members of the selected set.
 
 
 ## Philosophy

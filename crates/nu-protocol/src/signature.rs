@@ -39,6 +39,10 @@ pub struct Flag {
     // For custom commands
     pub var_id: Option<VarId>,
     pub default_value: Option<Value>,
+    #[serde(default)]
+    pub parameter_sets: Vec<String>,
+    #[serde(default)]
+    pub parameter_set_mandatory: Vec<String>,
 }
 
 impl Flag {
@@ -53,6 +57,8 @@ impl Flag {
             completion: None,
             var_id: None,
             default_value: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         }
     }
 
@@ -108,6 +114,10 @@ pub struct PositionalArg {
     // For custom commands
     pub var_id: Option<VarId>,
     pub default_value: Option<Value>,
+    #[serde(default)]
+    pub parameter_sets: Vec<String>,
+    #[serde(default)]
+    pub parameter_set_mandatory: Vec<String>,
 }
 
 impl PositionalArg {
@@ -120,6 +130,8 @@ impl PositionalArg {
             completion: None,
             var_id: None,
             default_value: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         }
     }
 
@@ -187,6 +199,227 @@ impl Completion {
                     .into_value(span),
             },
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterSet {
+    pub name: String,
+}
+
+impl ParameterSet {
+    #[inline]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ParameterId {
+    Positional(usize),
+    Rest,
+    Flag(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum ParameterRole {
+    RequiredPositional,
+    OptionalPositional,
+    Rest,
+    Flag {
+        long: Option<String>,
+        short: Option<char>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ParameterMembership {
+    pub all_sets: bool,
+    pub sets: Vec<String>,
+}
+
+impl ParameterMembership {
+    pub fn new(sets: Vec<String>) -> Self {
+        Self {
+            all_sets: sets.is_empty(),
+            sets,
+        }
+    }
+
+    pub fn active_sets<'a>(&'a self, all_sets: &'a [String]) -> Vec<&'a str> {
+        if self.all_sets {
+            all_sets.iter().map(|s| s.as_str()).collect()
+        } else {
+            self.sets.iter().map(|s| s.as_str()).collect()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParameterMetadata {
+    pub id: ParameterId,
+    pub name: String,
+    pub display_name: String,
+    pub role: ParameterRole,
+    pub membership: ParameterMembership,
+    pub mandatory_sets: Vec<String>,
+}
+
+impl ParameterMetadata {
+    fn from_positional(
+        id: ParameterId,
+        arg: &PositionalArg,
+        role: ParameterRole,
+        set_names: &[String],
+    ) -> Self {
+        let mut membership = ParameterMembership::new(arg.parameter_sets.clone());
+        let mut mandatory_sets = arg.parameter_set_mandatory.clone();
+        Self::expand_mandatory(&mut membership, &mut mandatory_sets, set_names);
+
+        let display_name = match role {
+            ParameterRole::Rest => format!("...{}", arg.name),
+            ParameterRole::OptionalPositional => format!("({})", arg.name),
+            ParameterRole::RequiredPositional => format!("<{}>", arg.name),
+            ParameterRole::Flag { .. } => {
+                unreachable!("flags should not use positional constructor")
+            }
+        };
+
+        Self {
+            id,
+            name: arg.name.clone(),
+            display_name,
+            role,
+            membership,
+            mandatory_sets,
+        }
+    }
+
+    fn from_flag(flag: &Flag, set_names: &[String]) -> Self {
+        let mut membership = ParameterMembership::new(flag.parameter_sets.clone());
+        let mut mandatory_sets = flag.parameter_set_mandatory.clone();
+        Self::expand_mandatory(&mut membership, &mut mandatory_sets, set_names);
+
+        let long = if flag.long.is_empty() {
+            None
+        } else {
+            Some(flag.long.clone())
+        };
+        let short = flag.short;
+        let display_name = match (&long, short) {
+            (Some(long), Some(short)) => format!("--{long} (-{short})"),
+            (Some(long), None) => format!("--{long}"),
+            (None, Some(short)) => format!("-{short}"),
+            (None, None) => "--".to_string(),
+        };
+
+        let id = ParameterId::Flag(flag_key(&flag.long, flag.short));
+        let name = long.clone().unwrap_or_else(|| {
+            short
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "flag".to_string())
+        });
+
+        Self {
+            id,
+            name,
+            display_name,
+            role: ParameterRole::Flag { long, short },
+            membership,
+            mandatory_sets,
+        }
+    }
+
+    fn expand_mandatory(
+        membership: &mut ParameterMembership,
+        mandatory_sets: &mut Vec<String>,
+        all_sets: &[String],
+    ) {
+        dedup_strings(mandatory_sets);
+
+        if membership.all_sets {
+            // Parameters that belong to all parameter sets are only mandatory in
+            // those sets if they were explicitly marked as such via
+            // `@mandatory` or `@mandatory(...)`.
+            mandatory_sets.retain(|set| all_sets.iter().any(|name| name == set));
+        } else if !membership.sets.is_empty() {
+            mandatory_sets.retain(|set| membership.sets.iter().any(|m| m == set));
+        }
+    }
+
+    pub fn membership_sets<'a>(&'a self, all_sets: &'a [String]) -> Vec<&'a str> {
+        self.membership.active_sets(all_sets)
+    }
+
+    pub fn belongs_to_set(&self, set: &str, all_sets: &[String]) -> bool {
+        self.membership_sets(all_sets).contains(&set)
+    }
+
+    pub fn is_mandatory_in(&self, set: &str) -> bool {
+        self.mandatory_sets.iter().any(|s| s == set)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParameterSetsMetadata {
+    pub set_names: Vec<String>,
+    pub parameters: Vec<ParameterMetadata>,
+}
+
+impl ParameterSetsMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.set_names.is_empty()
+    }
+
+    pub fn summaries(&self) -> Vec<String> {
+        self.set_names
+            .iter()
+            .map(|set| {
+                let parts: Vec<String> = self
+                    .parameters
+                    .iter()
+                    .filter(|param| param.belongs_to_set(set, &self.set_names))
+                    .map(|param| {
+                        let mut text = param.display_name.clone();
+                        if param.is_mandatory_in(set) {
+                            text.push_str(" (mandatory)");
+                        }
+                        text
+                    })
+                    .collect();
+
+                if parts.is_empty() {
+                    format!("{set}: no arguments")
+                } else {
+                    format!("{set}: {}", parts.join(", "))
+                }
+            })
+            .collect()
+    }
+}
+
+fn flag_key(long: &str, short: Option<char>) -> String {
+    if !long.is_empty() {
+        long.to_string()
+    } else if let Some(short) = short {
+        format!("(short {short})")
+    } else {
+        "flag".to_string()
+    }
+}
+
+fn dedup_strings(values: &mut Vec<String>) {
+    let mut i = 0;
+    while i < values.len() {
+        let mut j = i + 1;
+        while j < values.len() {
+            if values[j] == values[i] {
+                values.remove(j);
+            } else {
+                j += 1;
+            }
+        }
+        i += 1;
     }
 }
 
@@ -314,6 +547,8 @@ pub struct Signature {
     pub optional_positional: Vec<PositionalArg>,
     pub rest_positional: Option<PositionalArg>,
     pub named: Vec<Flag>,
+    #[serde(default)]
+    pub parameter_sets: Vec<ParameterSet>,
     pub input_output_types: Vec<(Type, Type)>,
     pub allow_variants_without_examples: bool,
     pub is_filter: bool,
@@ -350,6 +585,7 @@ impl Signature {
             input_output_types: vec![],
             allow_variants_without_examples: false,
             named: vec![],
+            parameter_sets: vec![],
             is_filter: false,
             creates_scope: false,
             category: Category::Default,
@@ -419,6 +655,8 @@ impl Signature {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         };
         self.named.push(flag);
         self
@@ -522,6 +760,8 @@ impl Signature {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         });
 
         self
@@ -541,6 +781,8 @@ impl Signature {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         });
 
         self
@@ -566,6 +808,8 @@ impl Signature {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         });
 
         self
@@ -606,6 +850,8 @@ impl Signature {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         });
 
         self
@@ -630,6 +876,8 @@ impl Signature {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         });
 
         self
@@ -653,6 +901,8 @@ impl Signature {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         });
 
         self
@@ -844,6 +1094,86 @@ impl Signature {
             attributes,
             examples,
         })
+    }
+
+    pub fn collect_parameter_sets(&self) -> ParameterSetsMetadata {
+        let mut set_names: Vec<String> = Vec::new();
+
+        let mut add_set = |name: &str| {
+            if !name.is_empty() && !set_names.iter().any(|existing| existing == name) {
+                set_names.push(name.to_string());
+            }
+        };
+
+        for parameter_set in &self.parameter_sets {
+            add_set(&parameter_set.name);
+        }
+
+        let mut extend_sets = |sets: &[String]| {
+            for name in sets {
+                add_set(name);
+            }
+        };
+
+        for positional in &self.required_positional {
+            extend_sets(&positional.parameter_sets);
+            extend_sets(&positional.parameter_set_mandatory);
+        }
+
+        for positional in &self.optional_positional {
+            extend_sets(&positional.parameter_sets);
+            extend_sets(&positional.parameter_set_mandatory);
+        }
+
+        if let Some(rest) = &self.rest_positional {
+            extend_sets(&rest.parameter_sets);
+            extend_sets(&rest.parameter_set_mandatory);
+        }
+
+        for flag in &self.named {
+            extend_sets(&flag.parameter_sets);
+            extend_sets(&flag.parameter_set_mandatory);
+        }
+
+        let mut parameters = Vec::new();
+
+        for (idx, positional) in self.required_positional.iter().enumerate() {
+            parameters.push(ParameterMetadata::from_positional(
+                ParameterId::Positional(idx),
+                positional,
+                ParameterRole::RequiredPositional,
+                &set_names,
+            ));
+        }
+
+        let mut positional_index = self.required_positional.len();
+        for positional in &self.optional_positional {
+            parameters.push(ParameterMetadata::from_positional(
+                ParameterId::Positional(positional_index),
+                positional,
+                ParameterRole::OptionalPositional,
+                &set_names,
+            ));
+            positional_index += 1;
+        }
+
+        if let Some(rest) = &self.rest_positional {
+            parameters.push(ParameterMetadata::from_positional(
+                ParameterId::Rest,
+                rest,
+                ParameterRole::Rest,
+                &set_names,
+            ));
+        }
+
+        for flag in &self.named {
+            parameters.push(ParameterMetadata::from_flag(flag, &set_names));
+        }
+
+        ParameterSetsMetadata {
+            set_names,
+            parameters,
+        }
     }
 }
 

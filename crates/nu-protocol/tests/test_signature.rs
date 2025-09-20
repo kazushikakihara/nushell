@@ -1,4 +1,4 @@
-use nu_protocol::{Flag, PositionalArg, Signature, SyntaxShape};
+use nu_protocol::{Flag, ParameterSet, PositionalArg, Signature, SyntaxShape};
 
 #[test]
 fn test_signature() {
@@ -46,6 +46,8 @@ fn test_signature_chained() {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         })
     );
     assert_eq!(
@@ -57,6 +59,8 @@ fn test_signature_chained() {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         })
     );
     assert_eq!(
@@ -68,6 +72,8 @@ fn test_signature_chained() {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         })
     );
 
@@ -82,6 +88,8 @@ fn test_signature_chained() {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         })
     );
 
@@ -96,6 +104,8 @@ fn test_signature_chained() {
             var_id: None,
             default_value: None,
             completion: None,
+            parameter_sets: vec![],
+            parameter_set_mandatory: vec![],
         })
     );
 }
@@ -174,4 +184,31 @@ fn test_signature_round_trip() {
         .for_each(|(lhs, rhs)| assert_eq!(lhs, rhs));
 
     assert_eq!(signature.rest_positional, returned.rest_positional,);
+}
+
+#[test]
+fn collect_parameter_sets_summaries() {
+    let mut signature = Signature::new("foo");
+
+    let mut staged_flag = Flag::new("staged").short('s').required();
+    staged_flag.parameter_sets = vec!["staged".to_string()];
+    staged_flag.parameter_set_mandatory = vec!["staged".to_string()];
+
+    let mut rest = PositionalArg::new("paths", SyntaxShape::String);
+    rest.parameter_sets = vec!["paths".to_string()];
+    rest.parameter_set_mandatory = vec!["paths".to_string()];
+
+    signature.named.push(staged_flag);
+    signature.rest_positional = Some(rest);
+    signature.parameter_sets = vec![ParameterSet::new("staged"), ParameterSet::new("paths")];
+
+    let metadata = signature.collect_parameter_sets();
+    assert_eq!(
+        metadata.set_names,
+        vec!["staged".to_string(), "paths".to_string()]
+    );
+
+    let summaries = metadata.summaries();
+    assert!(summaries.iter().any(|entry| entry.contains("staged")));
+    assert!(summaries.iter().any(|entry| entry.contains("paths")));
 }

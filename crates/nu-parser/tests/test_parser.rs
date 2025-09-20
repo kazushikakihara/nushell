@@ -838,6 +838,190 @@ pub fn parse_attributes_external_alias() {
     assert!(parse_error.contains("Encountered error during parse-time evaluation"));
 }
 
+fn parse_with_def(source: &str) -> Vec<ParseError> {
+    let mut engine_state = EngineState::new();
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    working_set.add_decl(Box::new(Def));
+    let delta = working_set.render();
+    let _ = engine_state.merge_delta(delta);
+    let mut working_set = StateWorkingSet::new(&engine_state);
+
+    let _ = parse(&mut working_set, None, source.as_bytes(), false);
+
+    working_set.parse_errors
+}
+
+#[test]
+pub fn parameter_sets_accept_staged_choice() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --staged(-s) @set(staged) @mandatory
+            ...rest: string @set(paths) @mandatory(paths)
+        ] {}
+        foo -s
+        "#,
+    );
+
+    assert!(errors.is_empty(), "unexpected errors: {errors:#?}");
+}
+
+#[test]
+pub fn parameter_sets_accept_paths_choice() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --staged(-s) @set(staged) @mandatory
+            ...rest: string @set(paths) @mandatory(paths)
+        ] {}
+        foo alpha beta
+        "#,
+    );
+
+    assert!(errors.is_empty(), "unexpected errors: {errors:#?}");
+}
+
+#[test]
+pub fn parameter_sets_detect_conflict() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --staged(-s) @set(staged) @mandatory
+            ...rest: string @set(paths)
+        ] {}
+        foo -s file.txt
+        "#,
+    );
+
+    assert!(matches!(
+        errors.first(),
+        Some(ParseError::ParameterSetConflict { .. })
+    ))
+}
+
+#[test]
+pub fn parameter_sets_require_selection() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --staged(-s) @set(staged) @mandatory
+            ...rest: string @set(paths)
+        ] {}
+        foo
+        "#,
+    );
+
+    assert!(matches!(
+        errors.first(),
+        Some(ParseError::ParameterSetMissing { .. })
+    ))
+}
+
+#[test]
+pub fn parameter_sets_missing_mandatory_arguments() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --name(-n): string @set(named) @mandatory(named)
+            --id(-i): string @set(named) @mandatory(named)
+            --flag @set(flagged) @mandatory(flagged)
+            --dry-run @set(flagged)
+        ] {}
+        foo --dry-run
+        "#,
+    );
+
+    assert!(matches!(
+        errors.first(),
+        Some(ParseError::ParameterSetMissing { .. })
+    ))
+}
+
+#[test]
+pub fn parameter_sets_allow_shared_arguments() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --staged(-s) @set(staged) @mandatory
+            ...rest: string @set(paths) @mandatory(paths)
+            --dry-run @set(staged) @set(paths)
+        ] {}
+        foo -s --dry-run
+        foo gamma --dry-run
+        "#,
+    );
+
+    assert!(errors.is_empty(), "unexpected errors: {errors:#?}");
+}
+
+#[test]
+pub fn parameter_sets_detect_ambiguity() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --dry-run @set(staged) @set(paths)
+            --staged(-s) @set(staged)
+            ...rest: string @set(paths)
+        ] {}
+        foo --dry-run
+        "#,
+    );
+
+    assert!(matches!(
+        errors.first(),
+        Some(ParseError::ParameterSetAmbiguous { .. })
+    ))
+}
+
+#[test]
+pub fn parameter_attribute_unknown() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --staged @unknown(foo)
+        ] {}
+        "#,
+    );
+
+    assert!(matches!(
+        errors.first(),
+        Some(ParseError::UnknownParameterAttribute { .. })
+    ))
+}
+
+#[test]
+pub fn parameter_attribute_invalid_usage() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --flag @set
+        ] {}
+        "#,
+    );
+
+    assert!(matches!(
+        errors.first(),
+        Some(ParseError::InvalidParameterAttribute { .. })
+    ))
+}
+
+#[test]
+pub fn parameter_attribute_requires_membership() {
+    let errors = parse_with_def(
+        r#"
+        def foo [
+            --flag @set(alpha) @mandatory(beta)
+        ] {}
+        "#,
+    );
+
+    assert!(matches!(
+        errors.first(),
+        Some(ParseError::InvalidParameterAttribute { .. })
+    ))
+}
+
 #[test]
 pub fn parse_if_in_const_expression() {
     // https://github.com/nushell/nushell/issues/15321
